@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import supabase from "../utils/supabase";
 import {
   Dialog,
@@ -7,10 +7,17 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "./ui/dialog";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetClose,
+} from "./ui/sheet";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
-import { FiEdit2 } from "react-icons/fi"; // Import edit icon
+import { FiEdit2, FiX, FiMaximize2, FiMinimize2 } from "react-icons/fi";
 
 const Documents = ({ isLoggedIn, isChatAdmin, secret, roomId }) => {
   const [Docislandss, setDocislandss] = useState([]);
@@ -20,6 +27,13 @@ const Documents = ({ isLoggedIn, isChatAdmin, secret, roomId }) => {
   const [newIslandName, setNewIslandName] = useState("");
   const [editingIsland, setEditingIsland] = useState(null);
   const [editName, setEditName] = useState("");
+  const [previewDoc, setPreviewDoc] = useState(null);
+  const [previewIslandUuid, setPreviewIslandUuid] = useState(null);
+  const [isFullScreen, setIsFullScreen] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [editingFileName, setEditingFileName] = useState(false);
+  const [newFileName, setNewFileName] = useState("");
+  const [uploadProgress, setUploadProgress] = useState(0);
 
   // Fetch all Docislandss for the room
   const fetchDocislandss = async () => {
@@ -179,36 +193,107 @@ const Documents = ({ isLoggedIn, isChatAdmin, secret, roomId }) => {
         console.error("Error deleting file:", error.message);
       } else {
         fetchDocumentsForIsland(islandUuid);
+        // Close the preview if the deleted file is currently being previewed
+        if (previewDoc && previewDoc.name === fileName && previewIslandUuid === islandUuid) {
+          setShowPreview(false);
+          setPreviewDoc(null);
+          setPreviewIslandUuid(null);
+        }
       }
     } catch (err) {
       console.error("Unexpected error deleting file:", err);
     }
   };
 
+  // Updated to handle multiple files
   const handleFileUpload = async (event, islandUuid) => {
-    const file = event.target.files[0];
-    if (!file) return;
-
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+    
     setUploading(true);
-
+    setUploadProgress(0);
+    
     try {
-      const folderPath = `${roomId}/${islandUuid}/`;
-      const { error } = await supabase.storage
+      const uploadPromises = [];
+      
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const folderPath = `${roomId}/${islandUuid}/`;
+        uploadPromises.push(
+          supabase.storage
+            .from("Imagesanddocs")
+            .upload(`${folderPath}${file.name}`, file, {
+              cacheControl: "3600",
+              upsert: false,
+            })
+        );
+      }
+      
+      // Process all upload promises
+      for (let i = 0; i < uploadPromises.length; i++) {
+        await uploadPromises[i];
+        // Update progress
+        setUploadProgress(Math.round(((i + 1) / uploadPromises.length) * 100));
+      }
+      
+      // Refresh document list
+      fetchDocumentsForIsland(islandUuid);
+    } catch (err) {
+      console.error("Unexpected error uploading files:", err);
+    } finally {
+      setUploading(false);
+      setUploadProgress(0);
+    }
+  };
+
+  // File renaming function
+  const handleRenameFile = async () => {
+    if (!previewDoc || !previewIslandUuid || !newFileName.trim()) return;
+    
+    const oldPath = `${roomId}/${previewIslandUuid}/${previewDoc.name}`;
+    const fileExt = previewDoc.name.split('.').pop();
+    const newName = newFileName.endsWith(`.${fileExt}`) ? newFileName : `${newFileName}.${fileExt}`;
+    const newPath = `${roomId}/${previewIslandUuid}/${newName}`;
+    
+    try {
+      // First, download the file
+      const { data: fileData, error: downloadError } = await supabase.storage
         .from("Imagesanddocs")
-        .upload(`${folderPath}${file.name}`, file, {
+        .download(oldPath);
+      
+      if (downloadError) {
+        console.error("Error downloading file for rename:", downloadError.message);
+        return;
+      }
+      
+      // Then upload with the new name
+      const { error: uploadError } = await supabase.storage
+        .from("Imagesanddocs")
+        .upload(newPath, fileData, {
           cacheControl: "3600",
           upsert: false,
         });
-
-      if (error) {
-        console.error("Error uploading file:", error.message);
-      } else {
-        fetchDocumentsForIsland(islandUuid);
+        
+      if (uploadError) {
+        console.error("Error uploading file with new name:", uploadError.message);
+        return;
       }
+      
+      // Then delete the old file
+      const { error: deleteError } = await supabase.storage
+        .from("Imagesanddocs")
+        .remove([oldPath]);
+        
+      if (deleteError) {
+        console.error("Error deleting old file:", deleteError.message);
+      }
+      
+      // Update preview doc and fetch documents
+      setPreviewDoc({...previewDoc, name: newName});
+      fetchDocumentsForIsland(previewIslandUuid);
+      setEditingFileName(false);
     } catch (err) {
-      console.error("Unexpected error uploading file:", err);
-    } finally {
-      setUploading(false);
+      console.error("Unexpected error renaming file:", err);
     }
   };
 
@@ -244,6 +329,47 @@ const Documents = ({ isLoggedIn, isChatAdmin, secret, roomId }) => {
 
   const isPDF = (fileName) => {
     return fileName.toLowerCase().endsWith('.pdf');
+  };
+
+  const openPreview = (doc, islandUuid) => {
+    setPreviewDoc(doc);
+    setPreviewIslandUuid(islandUuid);
+    
+    // Extract the file name without extension for easier editing
+    const nameParts = doc.name.split('.');
+    const ext = nameParts.pop(); // Remove extension
+    const baseName = nameParts.join('.'); // Handle files with multiple dots
+    setNewFileName(baseName);
+    
+    setShowPreview(true);
+  };
+
+  const closePreview = () => {
+    setShowPreview(false);
+    setPreviewDoc(null);
+    setPreviewIslandUuid(null);
+    setIsFullScreen(false);
+    setEditingFileName(false);
+  };
+
+  const toggleFullScreen = () => {
+    setIsFullScreen(!isFullScreen);
+  };
+
+  const startEditFileName = () => {
+    if (previewDoc) {
+      // Keep the extension visible to the user for clarity
+      const nameParts = previewDoc.name.split('.');
+      const ext = nameParts.pop(); // Remove the extension
+      const baseName = nameParts.join('.'); // Handle files with multiple dots
+      
+      setNewFileName(baseName);
+      setEditingFileName(true);
+    }
+  };
+
+  const cancelEditFileName = () => {
+    setEditingFileName(false);
   };
 
   const renderThumbnail = (islandUuid, doc) => {
@@ -297,6 +423,64 @@ const Documents = ({ isLoggedIn, isChatAdmin, secret, roomId }) => {
     );
   };
 
+  // Render document preview content
+  const renderPreviewContent = () => {
+    if (!previewDoc || !previewIslandUuid) return null;
+
+    if (isImage(previewDoc.name)) {
+      return (
+        <img
+          src={getPublicURL(previewIslandUuid, previewDoc.name)}
+          alt={previewDoc.name}
+          className="max-w-full max-h-[80vh] rounded-lg object-contain"
+        />
+      );
+    } else if (isPDF(previewDoc.name)) {
+      return (
+        <iframe
+          src={getPublicURL(previewIslandUuid, previewDoc.name)}
+          title={previewDoc.name}
+          className="w-full h-[80vh] border-2 border-gray-600 rounded-lg"
+        />
+      );
+    } else if (isDocument(previewDoc.name)) {
+      return (
+        <iframe
+          src={getPublicURL(previewIslandUuid, previewDoc.name)}
+          title={previewDoc.name}
+          className="w-full h-[80vh] border-2 border-gray-600 rounded-lg"
+        />
+      );
+    } else if (isAudio(previewDoc.name)) {
+      return (
+        <audio controls className="mt-10">
+          <source
+            src={getPublicURL(previewIslandUuid, previewDoc.name)}
+            type="audio/ogg"
+          />
+          <source
+            src={getPublicURL(previewIslandUuid, previewDoc.name)}
+            type="audio/mpeg"
+          />
+          Your browser does not support the audio tag.
+        </audio>
+      );
+    } else if (isVideo(previewDoc.name)) {
+      return (
+        <video controls className="max-w-full max-h-[80vh]">
+          <source src={getPublicURL(previewIslandUuid, previewDoc.name)} type="video/mp4" />
+          <source src={getPublicURL(previewIslandUuid, previewDoc.name)} type="video/ogg" />
+          Your browser does not support HTML video.
+        </video>
+      );
+    }
+    return (
+      <p className="text-gray-400">
+        Cannot preview this file type.
+      </p>
+    );
+  };
+
   const renderGrid = (islandUuid) => {
     const islandDocs = documents[islandUuid] || [];
     const isAdmin = isLoggedIn && isChatAdmin === secret;
@@ -316,98 +500,64 @@ const Documents = ({ isLoggedIn, isChatAdmin, secret, roomId }) => {
       >
         {cells.map((doc, index) =>
           doc || isAdmin ? (
-            <Dialog key={index}>
-              <DialogTrigger className="w-full h-full">
-                <div className="w-full h-full border border-gray-700 rounded-lg bg-[#1a1a1a] cursor-pointer overflow-hidden aspect-square">
-                  {doc
-                    ? renderThumbnail(islandUuid, doc)
-                    : isAdmin && (
-                        <div className="w-full h-full flex items-center justify-center text-gray-500">
-                          +
-                        </div>
-                      )}
-                </div>
-              </DialogTrigger>
-              <DialogContent className="sm:max-w-[800px] border-gray-700 bg-[#0f0f0f]">
-                <DialogHeader>
-                  <DialogTitle className="text-white">
-                    {doc ? doc.name : "Upload File"}
-                  </DialogTitle>
-                </DialogHeader>
-                {doc ? (
-                  <>
-                    <div className="flex justify-center items-center mt-4">
-                      {isImage(doc.name) ? (
-                        <img
-                          src={getPublicURL(islandUuid, doc.name)}
-                          alt={doc.name}
-                          className="max-w-full max-h-[500px] rounded-lg"
-                        />
-                      ) : isPDF(doc.name) ? (
-                        <div className="w-[70%]">
-                          <iframe
-                            src={getPublicURL(islandUuid, doc.name)}
-                            title={doc.name}
-                            className="w-full h-[480px] border-2 border-gray-600 rounded-lg"
-                          />
-                        </div>
-                      ) : isDocument(doc.name) ? (
-                        <iframe
-                          src={getPublicURL(islandUuid, doc.name)}
-                          title={doc.name}
-                          className="w-full h-[500px] border-2 border-gray-600 rounded-lg"
-                        />
-                      ) : isAudio(doc.name) ? (
-                        <audio controls>
-                          <source
-                            src={getPublicURL(islandUuid, doc.name)}
-                            type="audio/ogg"
-                          />
-                          <source
-                            src={getPublicURL(islandUuid, doc.name)}
-                            type="audio/mpeg"
-                          />
-                          Your browser does not support the audio tag.
-                        </audio>
-                      ) : isVideo(doc.name) ? (
-                        <video width="500px" controls>
-                          <source src={getPublicURL(islandUuid, doc.name)} type="video/mp4" />
-                          <source src={getPublicURL(islandUuid, doc.name)} type="video/ogg" />
-                          Your browser does not support HTML video.
-                        </video>
-                      ) : (
-                        <p className="text-gray-400">
-                          Cannot preview this file type.
-                        </p>
-                      )}
-                    </div>
-                    {isAdmin && (
-                      <div className="flex justify-center items-center mt-4">
-                        <button
-                          onClick={() => handleDeleteFile(islandUuid, doc.name)}
-                          className="ml-4 bg-red-600 text-white px-2 py-1 w-1/4 rounded hover:bg-red-700"
-                        >
-                          Delete
-                        </button>
+            <div key={index} className="w-full h-full">
+              <div 
+                className="w-full h-full border border-gray-700 rounded-lg bg-[#1a1a1a] cursor-pointer overflow-hidden aspect-square"
+                onClick={() => doc ? openPreview(doc, islandUuid) : null}
+              >
+                {doc
+                  ? renderThumbnail(islandUuid, doc)
+                  : isAdmin && (
+                      <div className="w-full h-full flex items-center justify-center text-gray-500">
+                        +
                       </div>
                     )}
-                  </>
-                ) : (
-                  isAdmin && (
+              </div>
+              {/* Upload Dialog for empty cells */}
+              {!doc && isAdmin && (
+                <Dialog>
+                  <DialogTrigger asChild>
+                    <button type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="radix-:r15:" data-state="closed" className="w-full h-full">
+                      <div className="w-full h-full border border-gray-700 rounded-lg bg-[#1a1a1a] cursor-pointer overflow-hidden aspect-square">
+                        <div className="w-full h-full flex items-center justify-center text-gray-500">+</div>
+                      </div>
+                    </button>
+                  </DialogTrigger>
+                  <DialogContent className="sm:max-w-[800px] border-gray-700 bg-[#0f0f0f]">
+                    <DialogHeader>
+                      <DialogTitle className="text-white">
+                        Upload Files
+                      </DialogTitle>
+                    </DialogHeader>
                     <div className="mt-4">
+                      <Label htmlFor="uploadFiles" className="block mb-2 text-sm font-medium text-white">
+                        Select multiple files to upload
+                      </Label>
                       <Input
+                        id="uploadFiles"
                         type="file"
+                        multiple
                         onChange={(e) => handleFileUpload(e, islandUuid)}
                         disabled={uploading}
+                        className="block w-full text-sm border border-gray-600 rounded-lg cursor-pointer bg-[#1a1a1a] focus:outline-none"
                       />
+                      <p className="mt-1 text-xs text-gray-400">You can select multiple files at once</p>
                       {uploading && (
-                        <p className="text-gray-400 mt-2">Uploading...</p>
+                        <div className="mt-4">
+                          <div className="w-full bg-gray-700 rounded-full h-2.5">
+                            <div 
+                              className="bg-blue-600 h-2.5 rounded-full" 
+                              style={{ width: `${uploadProgress}%` }}
+                            ></div>
+                          </div>
+                          <p className="text-gray-400 mt-2">Uploading... {uploadProgress}%</p>
+                        </div>
                       )}
                     </div>
-                  )
-                )}
-              </DialogContent>
-            </Dialog>
+                  </DialogContent>
+                </Dialog>
+              )}
+            </div>
           ) : null
         )}
       </div>
@@ -483,6 +633,77 @@ const Documents = ({ isLoggedIn, isChatAdmin, secret, roomId }) => {
           ))}
         </div>
       )}
+
+      {/* Right side document preview sheet */}
+      <Sheet open={showPreview} onOpenChange={setShowPreview} side="right">
+        <SheetContent 
+          className={`${isFullScreen ? 'w-screen p-0 inset-0 max-w-full' : 'w-full md:max-w-md'} bg-[#0f0f0f] border-gray-700`}
+          overlayClassName="z-50"
+          style={isFullScreen ? {position: 'fixed', top: 0, left: 0, right: 0, bottom: 0} : {}}
+        >
+          <div className={`${isFullScreen ? 'p-4' : ''} flex flex-col h-full`}>
+            <SheetHeader className="flex flex-row items-center justify-between mb-4">
+              <div className="flex items-center gap-2 flex-1">
+                {editingFileName ? (
+                  <div className="flex items-center gap-2 flex-1">
+                    <Input
+                      value={newFileName}
+                      onChange={(e) => setNewFileName(e.target.value)}
+                      className="text-lg"
+                      autoFocus
+                    />
+                    <Button onClick={handleRenameFile} size="sm">Save</Button>
+                    <Button onClick={cancelEditFileName} variant="outline" size="sm">Cancel</Button>
+                  </div>
+                ) : (
+                  <>
+                    <SheetTitle className="text-white flex-1 overflow-hidden text-ellipsis">
+                      {previewDoc?.name}
+                    </SheetTitle>
+                    {isLoggedIn && isChatAdmin === secret && (
+                      <button
+                        onClick={startEditFileName}
+                        className="p-1 hover:bg-gray-700 rounded-full transition-colors"
+                      >
+                        <FiEdit2 size={14} />
+                      </button>
+                    )}
+                  </>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={toggleFullScreen}
+                  className="p-1 hover:bg-gray-700 rounded-full transition-colors"
+                >
+                  {isFullScreen ? <FiMinimize2 size={18} /> : <FiMaximize2 size={18} />}
+                </button>
+                <SheetClose asChild>
+                  <button className="p-1 hover:bg-gray-700 rounded-full transition-colors">
+                    <FiX size={18} />
+                  </button>
+                </SheetClose>
+              </div>
+            </SheetHeader>
+            
+            <div className="flex-1 overflow-auto flex items-center justify-center">
+              {renderPreviewContent()}
+            </div>
+            
+            {isLoggedIn && isChatAdmin === secret && previewDoc && (
+              <div className="mt-4 flex justify-center">
+                <Button
+                  onClick={() => handleDeleteFile(previewIslandUuid, previewDoc.name)}
+                  variant="destructive"
+                  className="bg-red-600 hover:bg-red-700"
+                >
+                  Delete
+                </Button>
+              </div>
+            )}
+          </div>
+        </SheetContent>
+      </Sheet>
     </div>
   );
 };

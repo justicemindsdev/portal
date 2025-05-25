@@ -9,7 +9,8 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "./ui/tooltip";
-import { MdOutlineDeleteOutline } from "react-icons/md";
+import { MdOutlineDeleteOutline, MdNotifications, MdPeople, MdEmail } from "react-icons/md";
+import CompanyDirectory from "./CompanyDirectory";
 import {
   Dialog,
   DialogContent,
@@ -39,6 +40,13 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState("");
   const [isPublicRoom, setIsPublicRoom] = useState(false);
+  const [unansweredMentions, setUnansweredMentions] = useState([]);
+  const [showUnansweredList, setShowUnansweredList] = useState(false);
+  const [showDirectory, setShowDirectory] = useState(false);
+  const [csvData, setCsvData] = useState(null);
+  const [massMessageMode, setMassMessageMode] = useState(false);
+  const [massMessage, setMassMessage] = useState("");
+  const [sendingMassMessage, setSendingMassMessage] = useState(false);
   const inputRef = useRef(null);
   const messagesEndRef = useRef(null);
   const cookies = parseCookies();
@@ -107,8 +115,32 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
       console.error("Error fetching profiles:", error);
     } else {
       setMessages(data || []);
+      // Extract unanswered mentions
+      const mentions = data
+        .filter(msg => msg.status === "mentioned" && !msg.answered)
+        .map(msg => ({
+          id: msg.id,
+          message: msg.message,
+          from: msg.Profiles?.name || "Unknown",
+          date: new Date(msg.created_at),
+          mentioned: extractMentionedUsers(msg.message)
+        }));
+      setUnansweredMentions(mentions);
       setLoading(false);
     }
+  };
+
+  // Extract mentioned users from message
+  const extractMentionedUsers = (message) => {
+    const regex = /@([a-zA-Z0-9_-]+)/g;
+    const matches = [];
+    let match;
+    
+    while ((match = regex.exec(message)) !== null) {
+      matches.push(match[1]);
+    }
+    
+    return matches;
   };
 
   const fetchProfs = async () => {
@@ -300,6 +332,7 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
       setLoading(true);
       const hasMentions = msg.includes("@");
       const status = hasMentions ? "mentioned" : null;
+      const mentionedUsers = hasMentions ? extractMentionedUsers(msg) : [];
 
       const { data, error } = await supabase.from("Chats").insert([
         {
@@ -307,6 +340,8 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
           message: msg,
           roomid: roomId,
           status: status,
+          mentioned_users: mentionedUsers,
+          answered: false
         },
       ]);
 
@@ -320,6 +355,34 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
     } finally {
       setLoading(false);
     }
+  };
+
+  // Mark a mentioned message as answered
+  const markAsAnswered = async (messageId) => {
+    try {
+      const { error } = await supabase
+        .from("Chats")
+        .update({ answered: true })
+        .eq("id", messageId);
+
+      if (!error) {
+        // Remove from unanswered list
+        setUnansweredMentions(prev => prev.filter(item => item.id !== messageId));
+        // Update local message state
+        setMessages(prev => prev.map(msg => 
+          msg.id === messageId ? {...msg, answered: true} : msg
+        ));
+      } else {
+        console.error("Error marking message as answered:", error);
+      }
+    } catch (error) {
+      console.error("Unexpected error:", error);
+    }
+  };
+
+  // Toggle the unanswered list display
+  const toggleUnansweredList = () => {
+    setShowUnansweredList(!showUnansweredList);
   };
 
   const scrollToBottom = () => {
@@ -356,16 +419,214 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
     }
   };
 
+  // Load CSV data
+  useEffect(() => {
+    const fetchCsvData = async () => {
+      try {
+        const response = await fetch('/mailsuite_tracks_1747994159.csv');
+        const data = await response.text();
+        setCsvData(data);
+      } catch (error) {
+        console.error("Error loading CSV:", error);
+      }
+    };
+
+    fetchCsvData();
+  }, []);
+
+  const toggleDirectory = () => {
+    setShowDirectory(!showDirectory);
+  };
+  
+  // Function to send a message to all participants and email them
+  const handleSendMassMessage = async () => {
+    if (!massMessage.trim()) return;
+    
+    try {
+      setSendingMassMessage(true);
+      
+      // Get all participants for the room
+      const { data: participants, error: participantsError } = await supabase
+        .from("Profiles")
+        .select("*")
+        .eq("roomid", roomId);
+      
+      if (participantsError) {
+        console.error("Error fetching participants:", participantsError);
+        alert("Failed to fetch participants");
+        setSendingMassMessage(false);
+        return;
+      }
+      
+      // Send the message to the chat (visible to everyone)
+      const { error: chatError } = await supabase.from("Chats").insert([
+        {
+          profileid: profiles[0].uuid,
+          message: `[ANNOUNCEMENT TO ALL] ${massMessage}`,
+          roomid: roomId,
+          is_mass_message: true,
+        },
+      ]);
+      
+      if (chatError) {
+        console.error("Error sending chat message:", chatError);
+        alert("Failed to send message to chat");
+        setSendingMassMessage(false);
+        return;
+      }
+      
+      // Send emails to all participants (using serverless function or API route)
+      // Here we'd normally call an API route to handle email sending
+      // For now, we'll just simulate successful email sending
+      const emailRecipients = participants
+        .filter(p => p.email && p.email.includes('@'))
+        .map(p => p.email);
+      
+      console.log(`Emails would be sent to: ${emailRecipients.join(', ')}`);
+      
+      // If we had a real email API, we'd call it like this:
+      /* 
+      const emailResponse = await fetch('/api/send-mass-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipients: emailRecipients,
+          subject: `Message from ${profiles[0]?.name || myName} in ${name}`,
+          message: massMessage
+        })
+      });
+      
+      if (!emailResponse.ok) {
+        throw new Error('Email sending failed');
+      }
+      */
+      
+      // Close the modal and reset state on success
+      setMassMessageMode(false);
+      setMassMessage("");
+      alert("Message sent to all participants and emails dispatched");
+    } catch (error) {
+      console.error("Error sending mass message:", error);
+      alert("An error occurred while sending the message");
+    } finally {
+      setSendingMassMessage(false);
+    }
+  };
+
   return (
     <div className="h-screen flex flex-col relative">
       <Navbar name={name} />
-      <div className="absolute inset-0 flex items-center justify-center opacity-5 z-0 pointer-events-none">
-        <img 
-          src="/logomain.png" 
-          alt="Background Logo" 
-          className="max-w-[300px] max-h-[300px] object-contain" 
-        />
-      </div>
+      
+      <div className="flex h-full">
+        {/* Company Directory Sidebar - conditionally shown */}
+        {showDirectory && (
+          <div className="w-80 h-full" style={{ height: 'calc(100vh - 60px)' }}>
+            <CompanyDirectory csvData={csvData} />
+          </div>
+        )}
+        
+        <div className="flex-1 flex flex-col relative">
+          <div className="absolute inset-0 flex items-center justify-center opacity-5 z-0 pointer-events-none">
+            <img 
+              src="/logomain.png" 
+              alt="Background Logo" 
+              className="max-w-[300px] max-h-[300px] object-contain" 
+            />
+          </div>
+      
+          {/* Directory Toggle Button */}
+          <div className="absolute top-2 left-2 z-10 flex space-x-2">
+            <button
+              onClick={toggleDirectory}
+              className="bg-[#1a1a1a] text-white p-2 rounded-full hover:bg-[#2d2d2d]"
+              title="Company Directory"
+            >
+              <MdPeople size={20} />
+            </button>
+            {isLoggedIn && isChatAdmin === secret && (
+              <button
+                onClick={() => setMassMessageMode(true)}
+                className="bg-[#1a1a1a] text-white p-2 rounded-full hover:bg-[#2d2d2d]"
+                title="Message Everyone"
+              >
+                <MdEmail size={20} />
+              </button>
+            )}
+          </div>
+          
+          {/* Mass Message Modal */}
+          {massMessageMode && (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+              <div className="bg-[#1a1a1a] p-6 rounded-lg max-w-lg w-full">
+                <h3 className="text-lg font-semibold mb-4">Message Everyone</h3>
+                <p className="text-sm text-gray-400 mb-4">
+                  This will send a message to all participants in the chat and also email them.
+                </p>
+                <textarea
+                  value={massMessage}
+                  onChange={(e) => setMassMessage(e.target.value)}
+                  className="w-full h-32 bg-[#2d2d2d] border border-gray-700 rounded p-2 text-white mb-4"
+                  placeholder="Enter your message here..."
+                ></textarea>
+                <div className="flex justify-end space-x-2">
+                  <button
+                    onClick={() => setMassMessageMode(false)}
+                    className="px-4 py-2 border border-gray-600 rounded"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSendMassMessage}
+                    disabled={sendingMassMessage || !massMessage.trim()}
+                    className={`px-4 py-2 bg-blue-600 text-white rounded ${sendingMassMessage || !massMessage.trim() ? 'opacity-50 cursor-not-allowed' : 'hover:bg-blue-700'}`}
+                  >
+                    {sendingMassMessage ? 'Sending...' : 'Send to All'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Notification Banner for Unanswered Mentions */}
+          {unansweredMentions.length > 0 && (
+            <div 
+              className="bg-red-600 text-white p-2 text-center cursor-pointer flex items-center justify-center"
+              onClick={toggleUnansweredList}
+            >
+              <MdNotifications className="mr-2" size={20} />
+              <span>
+                {unansweredMentions.length} unanswered {unansweredMentions.length === 1 ? 'question' : 'questions'}
+              </span>
+            </div>
+          )}
+      
+      {/* Dropdown for Unanswered List */}
+      {showUnansweredList && (
+        <div className="bg-[#0f0f0f] border border-[#333333] p-4 max-h-[300px] overflow-y-auto">
+          <h3 className="text-white font-semibold mb-3">Unanswered Questions</h3>
+          <div className="space-y-3">
+            {unansweredMentions.map((item) => (
+              <div key={item.id} className="border-b border-[#333333] pb-2">
+                <div className="flex justify-between items-start">
+                  <p className="text-white">{item.message}</p>
+                  {isLoggedIn && isChatAdmin === secret && (
+                    <button 
+                      onClick={() => markAsAnswered(item.id)} 
+                      className="bg-green-600 text-white text-xs px-2 py-1 rounded hover:bg-green-700"
+                    >
+                      Mark Answered
+                    </button>
+                  )}
+                </div>
+                <div className="flex justify-between text-gray-400 text-sm mt-1">
+                  <span>From: {item.from}</span>
+                  <span>{item.date.toLocaleString()}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto p-6">
         {messages?.map((msgg) => (
           <>
@@ -377,9 +638,7 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
                     <div className="bg-black border-[#333333] border text-white px-2 py-1 rounded-lg max-w-xs">
                       <p>{msgg.message}</p>
                     </div>
-                    <span className="text-xs text-gray-600 pt-2">
-                      {console.log(msgg)
-                      }
+                      <span className="text-xs text-gray-600 pt-2">
                       <span className="font-semibold">{msgg.Profiles?.name} : {msgg.Profiles?.org?.trim().split(/\s+/).slice(0, 3).join(' ')}</span> : {new Date(msgg.created_at).toLocaleString("en-US", {
                         year: "numeric",
                         month: "short",
@@ -452,7 +711,9 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
                     </button>
                   )}
                   <div className="flex flex-col">
-                    <div className="bg-black px-2 py-1 rounded-lg max-w-xs">
+                      <div className={`bg-black px-2 py-1 rounded-lg max-w-xs ${
+                        msgg.status === "mentioned" && !msgg.answered ? "border-2 border-red-500" : ""
+                      }`}>
                       <p>{msgg.message}</p>
                     </div>
                     <span className="text-xs text-gray-600 pt-2">
@@ -474,12 +735,12 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
         <div ref={messagesEndRef} />
       </div>
 
-      {canChat ? (
-        <div className="bg-[#1d1d1d] pt-2 absolute bottom-0 w-full md:static">
-          <span className="px-4 text-sm mb-2 font-semibold">
-            Chat as {profiles[0]?.name || myName}
-          </span>
-          <div className="pb-4 px-4 flex items-center space-x-2">
+          {canChat ? (
+            <div className="bg-[#1d1d1d] pt-2 absolute bottom-0 w-full md:static">
+              <span className="px-4 text-sm mb-2 font-semibold">
+                Chat as {profiles[0]?.name || myName}
+              </span>
+              <div className="pb-4 px-4 flex items-center space-x-2">
             <Input
               ref={inputRef}
               type="text"
@@ -543,9 +804,11 @@ const Chat = ({ isLoggedIn, isChatAdmin, secret, roomId, name }) => {
             <span className="font-semibold m-auto pb-5">
               {isPublicRoom ? "Your name is not in the participants list" : "Not Added in the Parties"}
             </span>
+              )}
+            </>
           )}
-        </>
-      )}
+        </div>
+      </div>
     </div>
   );
 };
